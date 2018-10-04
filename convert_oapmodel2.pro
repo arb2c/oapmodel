@@ -1,0 +1,331 @@
+PRO convert_oapmodel2, fn, format=format, grey=grey, maxtime=maxtime, key=key, array=array, $
+    breakframes=breakframes, timestretch=timestretch, outdir=outdir, specialcase=specialcase, $
+    outfile=outfile, clockMhz=clockMhz
+   ;PRO to convert oapmodel data sets into native OAP formats
+   ;2/2014
+     
+   ;Defaults
+   IF n_elements(format) eq 0 THEN format='text'
+   IF n_elements(grey) eq 0 THEN grey=0
+   IF n_elements(maxtime) eq 0 THEN maxtime=0
+   IF n_elements(key) eq 0 THEN key=0
+   IF n_elements(array) eq 0 THEN array='V'  ;Default HVPS array
+   IF n_elements(breakframes) eq 0 THEN breakframes=0  ;Break up particles with empty slices into two
+   IF n_elements(timestretch) eq 0 THEN timestretch=0
+   IF n_elements(outdir) eq 0 THEN outdir=''
+   IF n_elements(specialcase) eq 0 THEN specialcase=0
+   IF n_elements(clockMhz) eq 0 THEN clockMhz=12.0 ;This can vary: 12 for Fast-2DC, 10 for CIP/PIP, 20 for 2DS/3V, 33 for Fast2DC_v2
+
+
+   ;Restore data and images
+   restore,fn
+   IF timestretch ne 0 THEN data.t=data.t*timestretch  ;Some sims have unrealistically small/large times, adjust here.
+
+   ;Some files have the 'pixelscleared' tag and some do not.  Fix here.
+   IF total(tag_names(data.dpart) eq 'PIXELSCLEARED') eq 0 THEN pixelscleared=fltarr(data.n) $
+      ELSE pixelscleared=data.dpart.pixelscleared
+   
+   ;Set suffix
+   CASE format OF
+      'text':suffix='.txt'
+      'DMT':suffix='.dmt'
+      'DMTPACS':suffix='.dmtpacs'
+      'SPEC':suffix='.2DS'+array
+      'NCAR':suffix='.2d'
+      'SEA':suffix='.sea'
+      ELSE:suffix=''
+   ENDCASE
+   IF grey eq 1 THEN suffix=suffix+'_grey'
+   IF key eq 1 THEN suffix=suffix+'.key'
+   
+   ;Filename management
+   bn=file_basename(fn,'.dat')
+   IF n_elements(outfile) eq 0 THEN outfile=outdir+bn+suffix
+   print,outfile
+
+   ;File write start/stop times
+   IF max(data.t) lt maxtime THEN BEGIN
+      print,'Maxtime exceeds simulation length.  Returning.'
+      return
+   ENDIF
+   IF maxtime eq 0 THEN maxtime=max(data.t)   
+   lasti=max(where(data.t le maxtime))
+
+   lasttime=0D
+   thresh=1
+   pcounter=0L  ;Count of particles written
+   IF grey eq 1 THEN thresh=0
+
+   
+   ;Write the file headers and initialize variables
+   close,1,2
+   IF format eq 'text' THEN BEGIN
+      openw,1,outfile
+      printf,1,'Resolution[um]:',data.op.res*1e6,'Num_Diodes:',data.op.ndiodes,'Arm_Wid[cm]:',$
+             data.op.armwidth*1e2,'TAS[m/s]:',data.op.tas, 'Duration[s]:', maxtime, format='(a15,i4,a15,i4,a15,f6.2,a15,f6.1,a15,f7.2)'
+      IF key eq 1 THEN printf,1,'ndiodes[#] nslices[#] time[s] int_time[s] modeled_diameter[um] z_position[m] particle_counter[#]'
+      sliceformat='(' + strtrim(string(fix(data.op.ndiodes)),2) + 'i1)'
+   ENDIF ELSE BEGIN
+      ;This will require 2 writes:  The streaming output first, then inserting the headers every 4Kb.
+      openw,1,'temp.raw'
+      IF (format eq 'DMT') or (format eq 'DMTPACS') THEN openw,2,'temp2.raw'  ;This is for RLEHB flags
+      pointer=ulonarr(1000000) ;Record the file pointer for the -end- of each written record
+      filetime=dblarr(1000000) ;Record the time for each record
+      c=0L
+      lasthkwrite=floor(data.t[0])
+   ENDELSE
+
+   ;For some reason this is very expensive, get this variable now instead of inside the loop
+   IF total(tag_names(data.dpart) eq 'MAXSHADOW') ne 0 THEN maxshadowavailable=1 ELSE maxshadowavailable=0
+   
+   ;Loop over particles in specified time range
+   FOR i=0L,lasti-1 DO BEGIN         
+      ;Data.slicestop is zero when no particle present, otherwise positive
+      areaimaged=data.dpart.area[i] + pixelscleared[i]
+      IF (grey eq 1) THEN areaimaged=data.dpart.sumgrey[i] + pixelscleared[i]  ;This ensures writing of grey particles that only have 25% pixels.  Comment out if want at least one 50% pixel.
+      IF (data.slicestop[i] gt 0) and (areaimaged gt 0) THEN BEGIN
+         xfull=oap_image(data, i, thresh=thresh, /clip)
+         ;Need to check for empty slices, since the probe would generate a new particle in that case.
+         slicetotal=total(xfull,1) < 1
+         
+         IF breakframes eq 1 THEN BEGIN  
+            ;Get start/stop indices of each frame
+            dslice=[slicetotal,0]-[0,slicetotal]
+            slicestart=where(dslice eq 1)
+            slicestop=where(dslice eq -1)-1
+            nframes=n_elements(slicestart) 
+            IF (data.op.ndiodes eq 32) or (data.op.ndiodes eq 64) THEN slicestop[nframes-1]=n_elements(slicetotal)-1  ;Keep the end-padding on the final slice PMS/DMT
+            IF (data.op.ndiodes eq 32) and (nframes gt 1) THEN slicestart[1:*]=slicestart[1:*]+1  ;Simulate missed slices for old probes   
+         ENDIF ELSE BEGIN
+            slicestart=0
+            slicestop=n_elements(slicetotal)-1
+            nframes=1
+         ENDELSE
+         
+         FOR iframe=0, nframes-1 DO BEGIN       
+            IF slicestop[iframe]-slicestart[iframe] ge 0 THEN BEGIN   ;Skip over 0-sized frames (generated by missed slices)
+               x=xfull[*,slicestart[iframe]:slicestop[iframe]]     ;Get the portion of the particle to use as image
+               nslices=n_elements(x)/data.op.ndiodes
+               IF iframe eq 0 THEN BEGIN
+                  ;First particle in frame
+                  inttime=data.t[i]-lasttime
+                  lasttime=data.t[i]
+                  slicecounter=long(data.t[i]*data.op.tas/data.op.res) + long(nslices)   ;Used for SPEC format, add nslices (4/6/2018) since time is defined at last slice
+               ENDIF ELSE BEGIN
+                  ;Subsequent particles
+                  inttime=(slicestart[iframe] - slicestart[iframe-1]) * data.op.res / data.op.tas
+                  lasttime=data.t[i] + slicestart[iframe] * data.op.res / data.op.tas 
+                  slicecounter=long(data.t[i]*data.op.tas/data.op.res) + slicestart[iframe] + long(nslices)  ;For SPEC, add nslices (4/6/2018) to define time at last slice
+               ENDELSE
+
+               IF format eq 'text' THEN BEGIN
+                     zcenter=data.modelboxsize[2]/2.0
+                     dcof=abs(data.z[i]-zcenter)    ;distance from center of focus
+                     IF key eq 1 THEN printf,1,'*',data.op.ndiodes, nslices, data.t[i], inttime, data.d[i], dcof, pcounter, format='(a1, i4, i4, f14.8, 3e10.2, i10)' $
+                     ELSE printf,1,'*',data.op.ndiodes, nslices, data.t[i], inttime, format='(a1, i4, i4, f14.8, e10.2)'
+                     printf,1,x,format=sliceformat
+                     pcounter=pcounter+1
+               ENDIF ELSE BEGIN
+                  IF format eq 'SPEC' THEN BEGIN
+                     frame=create_2ds_frame(x, slicecounter, c, array=array)
+                     ;Check if a housekeeping frame should be written
+                     IF floor(data.t[i]) ne lasthkwrite THEN BEGIN
+                        print,floor(data.t[i])
+                        hkbuffer=intarr(53)
+                        hkbuffer[0]=18507
+                        ;Set TAS
+                        hkbuffer[49]=17096s   ;=100 m/s, http://www.h-schmidt.net/FloatConverter/IEEE754.html, don't feel like programming this right now...
+                        ;Set counter
+                        hkbuffer[51]=frame[-2] ;(ishft(fullcounter,-16) and 'ffff'x)  ;Write timing word 1, bits 16-31
+                        hkbuffer[52]=frame[-1] ;(fullcounter and 'ffff'x)  ;Write timing word 1, bits 0-15
+                        writeu,1,hkbuffer
+                        lasthkwrite=floor(data.t[i])
+                     ENDIF
+                  ENDIF
+                  IF (format eq 'DMT') or (format eq 'DMTPACS') THEN BEGIN
+                     dofflag=1
+                     IF maxshadowavailable eq 1 && data.dpart.maxshadow[i] le 0.66 THEN dofflag=0
+                     frame=create_dmt_frame(x, data.t[i], c, grey=grey, rlehbflag=rlehbflag, dofflag=dofflag)
+                     
+                     ;Special case for Jonny/Sebastian project, put the z-position in counter and particle size in tas
+                     IF specialcase eq 1 THEN BEGIN
+                        c2write=long(data.d[i]) ;size in um
+                        tas2write=long((data.z[i] - data.op.pad)*1000)  ;dof in mm
+                        IF (tas2write gt 255) or (tas2write lt 0) or (c2write gt 65535) or (c2write lt 0) then stop,'Overrun in counters'
+                        frame=create_dmt_frame(x, lasttime, c2write, grey=grey, rlehbflag=rlehbflag, tas=tas2write, dofflag=dofflag)
+                     ENDIF
+                     
+                     IF grey eq 0 THEN writeu,2,rlehbflag
+                  ENDIF
+                  IF format eq 'NCAR' THEN BEGIN
+                     dofreject=0    ;Flags particles where maxshadow is below 66%
+                     IF maxshadowavailable eq 1 && data.dpart.maxshadow[i] le 0.66 THEN dofreject=1
+                     frame=create_ncar_frame(x, lasttime, clockMhz, dofreject)                    
+                  ENDIF
+                                    
+                  writeu,1,frame  ;Write the frame
+                  filetime[c]=data.t[i]
+                  point_lun,-1,dummy
+                  pointer[c]=dummy            
+                  c=c+1
+               ENDELSE
+            ENDIF
+         ENDFOR
+      ENDIF
+   ENDFOR          
+   close,1,2
+   pointer=pointer[0:c-1]  ;truncate to size
+   filetime=filetime[0:c-1]
+
+   ;Write the actual 2DS base file
+   IF format eq 'SPEC' THEN BEGIN
+      ;Make a new file with headers every 4096k.
+      openw,1,outfile
+      openr,2,'temp.raw'
+      filesize=(fstat(2)).size
+      nbuffers=filesize/4096
+      finalbuffersize=filesize mod 4096      
+
+      header={year:2010s, month:1s, dayofweek:0s, day:1s, hour:0s, minute:0s, second:0s, millisecond:0s}
+      checksum=-16723s  ;This seems to be the default value in real-life data.  But it does eventually vary, algorithm undocumented.
+      data=bytarr(4096)
+      FOR i=0L,nbuffers DO BEGIN
+         IF i eq nbuffers THEN BEGIN
+            ;The final buffer will probably be too short, pad with zeros
+            data=bytarr(4096)
+            datafinal=bytarr(finalbuffersize)
+            readu,2,datafinal
+            data[0:finalbuffersize-1]=datafinal            
+         ENDIF ELSE BEGIN
+            readu,2,data         
+         ENDELSE
+
+         k=max(where(pointer le (i+1)*4096))   ;Find index of last particle in buffer
+         t=filetime[k]
+         header.millisecond=(t-floor(t))*1000
+         sfm=long(filetime[k])
+         header.hour=sfm/3600l
+         header.minute=(sfm mod 3600)/60
+         header.second=(sfm mod 3600) mod 60
+         
+         writeu,1,header
+         writeu,1,data
+         writeu,1,checksum
+
+      ENDFOR
+      close,1
+      close,2
+   ENDIF
+
+   ;Write the actual DMT raw file
+   ;NOTE: May need to ensure each buffer starts with a RLEHB.  rlehbflag has been implemented in
+   ;create_dmt_frame, but not used here yet.  Need to be careful about skipping bytes, since it will
+   ;screw up sync with 'filetime'
+   IF (format eq 'DMT') or (format eq 'DMTPACS') THEN BEGIN
+      ;Make a new file with headers every 4096k.
+      openw,1,outfile
+      openr,2,'temp.raw'
+      openw,3,outfile+'.dmtindex'  ;The index file, which just includes the headers
+      filesize=(fstat(2)).size
+      nbuffers=filesize/4096
+      finalbuffersize=filesize mod 4096
+
+      header={year:2010S, month:1S, day:1S, hour:0S, minute:0S, second:0S, millisecond:0S, weekday:0S}
+      dummy=bytarr(12) ; this is to read in the 12 bytes of data after an image (no useful info contained)
+      data=bytarr(4096)
+      FOR i=0L,nbuffers DO BEGIN
+         IF i eq nbuffers THEN BEGIN
+            ;The final buffer will probably be too short, pad with zeros
+            data=bytarr(4096)
+            datafinal=bytarr(finalbuffersize)
+            readu,2,datafinal
+            data[0:finalbuffersize-1]=datafinal            
+         ENDIF ELSE BEGIN
+            readu,2,data         
+         ENDELSE
+
+         k=max(where(pointer le (i+1)*4096))   ;Find index of last particle in buffer
+         t=filetime[k]
+         header.millisecond=(t-floor(t))*1000
+         sfm=long(filetime[k])
+         header.hour=sfm/3600l
+         header.minute=(sfm mod 3600)/60
+         header.second=(sfm mod 3600) mod 60
+         
+         writeu,1,header
+         writeu,1,data
+         writeu,3,header
+         IF format eq 'DMTPACS' THEN writeu,1,dummy
+      ENDFOR
+      close,1
+      close,2     
+      close,3
+   ENDIF
+   
+   IF format eq 'NCAR' THEN BEGIN
+      openw,1,outfile
+      openr,2,'temp.raw'
+      
+      ;Figure out which probe to write
+      IF data.op.res eq 25e-6 THEN BEGIN
+         probeid='C4'
+         proberes='25'
+         probesn='F2DC003'
+      ENDIF
+      IF data.op.res eq 10e-6 THEN BEGIN
+         probeid='C6'
+         proberes='10'
+         probesn='F2DC002'      
+      ENDIF
+      probetype='Fast2DC'
+      IF clockMhz eq 33 THEN probetype='Fast2DC_v2'
+      IF clockMhz eq 10 THEN probetype='CIP'
+      IF clockMhz eq 20 THEN probetype='2DS'  ;?? need to check/test
+      
+      ;Print the XML header
+      printf,1,'<?xml version="1.0" encoding="ISO-8859-1"?>'
+      printf,1,'<OAP version="1">'
+      printf,1,' <Source>ncar.ucar.edu</Source>'
+      printf,1,' <FormatURL>http://www.eol.ucar.edu/raf/Software/OAPfiles.html</FormatURL>'
+      printf,1,' <Project>SOCRATES</Project>'   ;Have to use a real project, otherwise RAF's process2d gives an error looking from PMSpex
+      printf,1,' <Platform>GV_N677F</Platform>'
+      printf,1,' <FlightNumber>rf01</FlightNumber>'
+      printf,1,' <FlightDate>01/01/2018</FlightDate>'
+      printf,1,'  <probe id="'+probeid+'" type="'+probetype+'" resolution="'+proberes+'" nDiodes="64" serialnumber="'+probesn+'" suffix="_RWOI"/>'
+      printf,1,'</OAP>'
+   
+      header={probetype:(byte(probeid))[0], probenumber:(byte(probeid))[1], hour:0s, minute:0s, $
+        second:0s, year:2010s, month:1s, day:1s, tas:fix(data.op.tas), millisecond:0s, overload:0s}  
+
+      ;Write the buffers
+      filesize=(fstat(2)).size
+      data=bytarr(4096)
+      nbuffers=filesize/4096
+      finalbuffersize=filesize mod 4096
+      
+      FOR i=0L,nbuffers DO BEGIN
+         IF i eq nbuffers THEN BEGIN
+            ;The final buffer will probably be too short, pad with zeros
+            data=bytarr(4096)
+            datafinal=bytarr(finalbuffersize)
+            readu,2,datafinal
+            data[0:finalbuffersize-1]=datafinal            
+         ENDIF ELSE BEGIN
+            readu,2,data         
+         ENDELSE
+
+         k=(max(where(pointer le (i+1)*4096))+1) < (c-1)   ;Find index of last particle in buffer, then add 1 to get to next particle
+         t=filetime[k]
+         header.millisecond=(t-floor(t))*1000
+         sfm=long(filetime[k])
+         header.hour=sfm/3600l
+         header.minute=(sfm mod 3600)/60
+         header.second=(sfm mod 3600) mod 60
+         writeu,1,swap_endian(header)
+         writeu,1,data
+      ENDFOR  
+      close,1
+      close,2
+   ENDIF
+   
+END
